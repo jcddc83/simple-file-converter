@@ -16,6 +16,26 @@ from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PIL import Image
 import pdf2image
 
+# Prevent console windows from flashing when poppler subprocesses run on Windows.
+if sys.platform == 'win32':
+    import subprocess as _subprocess
+    _OrigPopen = _subprocess.Popen
+    class _PopenNoWindow(_OrigPopen):
+        def __init__(self, *args, **kwargs):
+            if 'creationflags' not in kwargs:
+                kwargs['creationflags'] = _subprocess.CREATE_NO_WINDOW
+            super().__init__(*args, **kwargs)
+    _subprocess.Popen = _PopenNoWindow
+
+
+class FocusSlider(QSlider):
+    """Slider that only responds to wheel events when it has keyboard focus."""
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
 
 class ConversionWorker(QThread):
     """Background worker for file conversion"""
@@ -480,7 +500,7 @@ class FileConverter(QMainWindow):
         quality_label.setMinimumWidth(120)
         quality_layout.addWidget(quality_label)
         quality_slider_layout = QHBoxLayout()
-        self.quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.quality_slider = FocusSlider(Qt.Orientation.Horizontal)
         self.quality_slider.setRange(1, 100)
         self.quality_slider.setValue(85)
         self.quality_slider.setMinimumHeight(40)

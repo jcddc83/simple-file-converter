@@ -35,8 +35,8 @@ A standalone desktop app for converting images and PDFs — drag, drop, convert.
 No pre-built binary is provided. Mac unsigned binaries trigger a security block that requires non-trivial workarounds, so the cleanest option is to run from source:
 
 ```bash
-git clone <this-repo-url>
-cd <repo-folder>
+git clone https://github.com/jcddc83/simple-file-converter.git
+cd simple-file-converter
 pip install -r requirements.txt
 # Mac/Linux: install poppler via Homebrew or apt
 brew install poppler          # macOS
