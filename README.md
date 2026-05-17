@@ -98,7 +98,7 @@ Presets are saved automatically to `%APPDATA%\FileConverter\presets.json` on Win
 ```powershell
 pip install -r requirements.txt
 pip install pyinstaller
-python -m PyInstaller --onefile --windowed --collect-all Pillow --name FileConverter converter.py
+python -m PyInstaller --onefile --windowed --collect-all Pillow --collect-all pdf2image --name FileConverter converter.py
 ```
 
 The exe will be in the `dist/` folder. Use `python -m PyInstaller` (not bare `pyinstaller`) to ensure PyInstaller runs in the same Python environment where your dependencies are installed.
@@ -107,7 +107,7 @@ To rebuild cleanly:
 
 ```powershell
 Remove-Item -Recurse -Force dist, build, FileConverter.spec
-python -m PyInstaller --onefile --windowed --collect-all Pillow --name FileConverter converter.py
+python -m PyInstaller --onefile --windowed --collect-all Pillow --collect-all pdf2image --name FileConverter converter.py
 ```
 
 ### Dependencies
