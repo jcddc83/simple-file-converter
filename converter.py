@@ -17,6 +17,10 @@ from PIL import Image
 import pdf2image
 from pdf2image import pdf2image as _pdf2image_impl
 
+
+class ConversionCancelledError(Exception):
+    """Raised internally when a conversion is cancelled by the user"""
+
 # Prevent console windows from flashing when poppler subprocesses run on Windows.
 # pdf2image binds Popen into its own namespace at import time
 # (from subprocess import Popen), so subprocess.Popen alone is not enough;
@@ -53,6 +57,15 @@ class ConversionWorker(QThread):
         self.input_file = input_file
         self.output_file = output_file
         self.settings = settings
+        self._cancelled = False
+
+    def cancel(self):
+        """Request cancellation; the worker stops at the next checkpoint"""
+        self._cancelled = True
+
+    def _check_cancelled(self):
+        if self._cancelled:
+            raise ConversionCancelledError()
 
     def run(self):
         try:
@@ -67,6 +80,8 @@ class ConversionWorker(QThread):
                 return
 
             self.finished.emit(f"Successfully converted to {self.output_file}")
+        except ConversionCancelledError:
+            self.error.emit("Cancelled")
         except Exception as e:
             self.error.emit(f"Conversion failed: {str(e)}")
 
@@ -94,17 +109,24 @@ class ConversionWorker(QThread):
 
         images = pdf2image.convert_from_path(self.input_file, **convert_kwargs)
 
+        self._check_cancelled()
         total_pages = len(images)
         self.progress.emit(10)
 
-        # Filter pages if specified
+        # Filter pages if specified; track the real page number of each
+        # rendered image so multi-page outputs are named after actual PDF
+        # pages (e.g. pages "1,3" -> _page1, _page3, not _page1, _page2).
+        page_numbers = None
         if page_list:
             first = convert_kwargs['first_page']
+            page_numbers = [p for p in page_list if p - first < total_pages]
             images = [images[p - first] for p in page_list if p - first < total_pages]
 
         # Resize if width/height specified
         if width or height:
-            images = [self.resize_image(img, width, height, 'max') for img in images]
+            for i, img in enumerate(images):
+                self._check_cancelled()
+                images[i] = self.resize_image(img, width, height, 'max')
 
         self.progress.emit(50)
 
@@ -118,9 +140,11 @@ class ConversionWorker(QThread):
             else:
                 images[0].save(self.output_file, 'JPEG', quality=quality)
         else:
-            # Multiple pages - save with page numbers
-            for i, img in enumerate(images, 1):
-                page_output = output_path.parent / f"{output_path.stem}_page{i}.{ext}"
+            # Multiple pages - save with the real PDF page numbers
+            for i, img in enumerate(images):
+                page_no = page_numbers[i] if page_numbers else i + 1
+                page_output = output_path.parent / f"{output_path.stem}_page{page_no}.{ext}"
+                self._check_cancelled()
                 if save_fmt == 'PNG':
                     img.save(str(page_output), 'PNG')
                 else:
@@ -140,6 +164,7 @@ class ConversionWorker(QThread):
         self.progress.emit(20)
 
         img = Image.open(self.input_file)
+        self._check_cancelled()
 
         # Capture EXIF from the original file before any compositing:
         # flattening onto a new background image drops .info (and with it
@@ -174,6 +199,7 @@ class ConversionWorker(QThread):
         if width or height:
             img = self.resize_image(img, width, height, fit)
 
+        self._check_cancelled()
         self.progress.emit(80)
 
         if output_format == 'png':
@@ -736,6 +762,25 @@ class FileConverter(QMainWindow):
         self.convert_btn.clicked.connect(self.convert_files)
         layout.addWidget(self.convert_btn)
 
+        # Cancel button - only visible while a batch is running
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                padding: 10px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+        """)
+        self.cancel_btn.clicked.connect(self.cancel_batch)
+        self.cancel_btn.setVisible(False)
+        layout.addWidget(self.cancel_btn)
+
         # Finalize scroll area
         scroll_area.setWidget(scroll_content)
         main_layout.addWidget(scroll_area)
@@ -879,10 +924,34 @@ class FileConverter(QMainWindow):
         if "height" in settings:
             self.pdf_height_input.setValue(settings["height"] or 0)
 
+    def get_batch_output_name(self, input_path, fmt, claimed):
+        """Output filename for a batch item. When several queued files share
+        the same stem (e.g. photos/a.jpg and photos/b/a.jpg), disambiguate
+        with a numeric suffix so one conversion can't overwrite or clobber
+        another (or trigger a false overwrite prompt)."""
+        candidate = f"{input_path.stem}.{fmt}"
+        if candidate in claimed:
+            n = 2
+            while f"{input_path.stem}_{n}.{fmt}" in claimed:
+                n += 1
+            candidate = f"{input_path.stem}_{n}.{fmt}"
+        claimed.add(candidate)
+        return str(self.output_dir / candidate)
+
     def convert_files(self):
         """Start batch file conversion"""
         if not self.input_files:
             return
+
+        # Pre-compute output names for the whole batch so same-stem files
+        # are disambiguated instead of silently colliding.
+        self.batch_output_names = {}
+        if len(self.input_files) > 1:
+            fmt = self.output_format_combo.currentText().lower()
+            claimed = set()
+            for f in self.input_files:
+                p = Path(f)
+                self.batch_output_names[f] = self.get_batch_output_name(p, fmt, claimed)
 
         # Ask for output directory for batch conversion
         if len(self.input_files) > 1:
@@ -919,12 +988,23 @@ class FileConverter(QMainWindow):
         self.batch_errors = []
         self.batch_successes = []
         self.overwrite_all = False
+        self.batch_cancelled = False
         self.convert_btn.setEnabled(False)
+        self.cancel_btn.setVisible(True)
         self.progress_bar.setVisible(True)
         self.convert_next_file()
 
+    def cancel_batch(self):
+        """User requested cancellation of the running batch"""
+        self.batch_cancelled = True
+        if hasattr(self, 'worker') and self.worker is not None:
+            self.worker.cancel()
+
     def convert_next_file(self):
         """Convert the next file in the batch"""
+        if self.batch_cancelled:
+            self.on_batch_complete()
+            return
         if self.current_batch_index >= len(self.input_files):
             # Batch complete
             self.on_batch_complete()
@@ -937,16 +1017,29 @@ class FileConverter(QMainWindow):
         is_pdf = input_path.suffix.lower() == '.pdf'
         if len(self.input_files) == 1 and hasattr(self, 'single_output_file'):
             output_file = self.single_output_file
+        elif getattr(self, 'batch_output_names', None) and input_file in self.batch_output_names:
+            output_file = self.batch_output_names[input_file]
         else:
             fmt = self.output_format_combo.currentText().lower()
             output_file = str(self.output_dir / f"{input_path.stem}.{fmt}")
 
-        # In batch mode, confirm before overwriting existing files
-        if len(self.input_files) > 1 and Path(output_file).exists() and not self.overwrite_all:
+        # In batch mode, confirm before overwriting existing files. For PDFs
+        # the output may be several page files (stem_pageN.ext), so check for
+        # any existing collision, not just the base name (which is never
+        # written for multi-page PDFs).
+        base_out = Path(output_file)
+        if is_pdf:
+            existing = sorted(base_out.parent.glob(f"{base_out.stem}_page*.{base_out.suffix.lstrip('.')}"))
+            collision = existing or ([base_out] if base_out.exists() else [])
+            collision_desc = ", ".join(p.name for p in existing[:3]) if existing else base_out.name
+        else:
+            collision = [base_out] if base_out.exists() else []
+            collision_desc = base_out.name
+        if len(self.input_files) > 1 and collision and not self.overwrite_all:
             reply = QMessageBox.question(
                 self,
                 "File Already Exists",
-                f"{Path(output_file).name} already exists. Overwrite?",
+                f"{collision_desc} already exists. Overwrite?",
                 QMessageBox.StandardButton.Yes |
                 QMessageBox.StandardButton.YesToAll |
                 QMessageBox.StandardButton.No |
@@ -998,12 +1091,23 @@ class FileConverter(QMainWindow):
 
     def on_file_conversion_finished(self, message):
         """Handle successful conversion of a single file in batch"""
-        self.batch_successes.append(self.input_files[self.current_batch_index])
+        # Report the file(s) actually written: a multi-page PDF produces
+        # stem_pageN.ext files rather than the base output path.
+        if Path(self.worker.input_file).suffix.lower() == '.pdf':
+            base_out = Path(self.worker.output_file)
+            expected = sorted(base_out.parent.glob(f"{base_out.stem}_page*.*"))
+            written = [p.name for p in expected] or [base_out.name]
+            self.batch_successes.append(", ".join(written))
+        else:
+            self.batch_successes.append(Path(self.worker.output_file).name)
         self.current_batch_index += 1
         self.convert_next_file()
 
     def on_file_conversion_error(self, error_message):
         """Handle conversion error for a single file in batch"""
+        if self.batch_cancelled:
+            self.on_batch_complete()
+            return
         failed_file = self.input_files[self.current_batch_index]
         self.batch_errors.append((Path(failed_file).name, error_message))
         self.current_batch_index += 1
@@ -1012,8 +1116,18 @@ class FileConverter(QMainWindow):
     def on_batch_complete(self):
         """Handle batch conversion completion"""
         self.progress_bar.setVisible(False)
+        self.cancel_btn.setVisible(False)
         self.status_label.setText("")
         self.convert_btn.setEnabled(True)
+        self.worker = None
+
+        if self.batch_cancelled:
+            QMessageBox.information(
+                self,
+                "Cancelled",
+                "Conversion cancelled."
+            )
+            return
 
         # Show results
         total = len(self.input_files)
@@ -1021,11 +1135,19 @@ class FileConverter(QMainWindow):
         error_count = len(self.batch_errors)
 
         if error_count == 0:
-            QMessageBox.information(
-                self,
-                "Success",
-                f"Successfully converted {success_count} file{'s' if success_count > 1 else ''}!"
-            )
+            if success_count == 1 and len(self.batch_successes[0].split(', ')) == 1:
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"Successfully converted to {self.batch_successes[0]}!"
+                )
+            else:
+                details = "\n".join(f"- {name}" for name in self.batch_successes)
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"Successfully converted {success_count} file{'s' if success_count > 1 else ''}:\n{details}"
+                )
         else:
             error_details = "\n".join([f"- {name}: {err}" for name, err in self.batch_errors])
             QMessageBox.warning(
@@ -1133,6 +1255,25 @@ class FileConverter(QMainWindow):
         self.preset_combo.blockSignals(False)
 
         QMessageBox.information(self, "Success", f"Preset '{preset_name}' deleted successfully!")
+
+
+    def closeEvent(self, event):
+        """Wait for a running conversion before closing, so the worker
+        thread never gets destroyed mid-run (which crashes the app)."""
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "Conversion in Progress",
+                "A conversion is still running. Cancel it and close?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.batch_cancelled = True
+            self.worker.cancel()
+            self.worker.wait(10000)
+        event.accept()
 
 
 def main():
