@@ -1092,10 +1092,12 @@ class FileConverter(QMainWindow):
     def on_file_conversion_finished(self, message):
         """Handle successful conversion of a single file in batch"""
         # Report the file(s) actually written: a multi-page PDF produces
-        # stem_pageN.ext files rather than the base output path.
+        # stem_pageN.ext files rather than the base output path. Match only
+        # the current run's extension so stale page files from earlier
+        # conversions in a different format aren't listed.
         if Path(self.worker.input_file).suffix.lower() == '.pdf':
             base_out = Path(self.worker.output_file)
-            expected = sorted(base_out.parent.glob(f"{base_out.stem}_page*.*"))
+            expected = sorted(base_out.parent.glob(f"{base_out.stem}_page*{base_out.suffix}"))
             written = [p.name for p in expected] or [base_out.name]
             self.batch_successes.append(", ".join(written))
         else:
