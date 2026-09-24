@@ -1,3 +1,4 @@
+<img width="946" height="491" alt="simple file converter screenshot 9-2026" src="https://github.com/user-attachments/assets/90ad8594-dab8-48b8-9e6a-597d1216321d" />
 # File Converter
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
