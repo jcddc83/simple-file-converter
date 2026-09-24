@@ -449,7 +449,7 @@ class FileConverter(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("File Converter - PDF/Images to JPG or PNG")
+        self.setWindowTitle("Simple File Converter - PDF/Images to JPG or PNG")
         self.setMinimumSize(850, 600)
         self.resize(850, 800)  # Start with comfortable default size
 
