@@ -610,6 +610,12 @@ class FileConverter(QMainWindow):
                 margin: -8px 0;
                 border-radius: 10px;
             }
+            QSlider::groove:horizontal:disabled {
+                background: #ebebeb;
+            }
+            QSlider::handle:horizontal:disabled {
+                background: #b8b8b8;
+            }
         """)
         self.quality_slider.valueChanged.connect(self.update_quality_label)
         self._quality_touched = False
