@@ -13,7 +13,7 @@ A standalone desktop app for converting images and PDFs — drag, drop, convert.
 ## Features
 
 - **Input formats:** AVIF, WEBP, PNG, JPG, BMP, TIFF, PDF
-- **Output formats:** JPG or PNG (selectable per conversion)
+- **Output formats:** JPG or PNG (selectable per conversion, for images and PDFs)
 - **Batch conversion:** queue multiple files and convert in one go
 - **PDF support:** choose DPI, page range, and output dimensions
 - **Resize options:** fit within bounds, crop to exact dimensions, or stretch
@@ -77,6 +77,8 @@ python converter.py
 | Pixel Density (DPI) | Resolution of the output image. Default 300. Higher = larger file, more detail. |
 | Width / Height | Optional output dimensions. `0` = determined by DPI. |
 | Pages | `all`, a range (`1-3`), or specific pages (`1,3,5`). |
+
+Output format (JPG/PNG) is chosen in Image Settings and applies to PDFs as well.
 
 ---
 
