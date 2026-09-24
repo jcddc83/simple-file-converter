@@ -15,8 +15,12 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PIL import Image
 import pdf2image
+from pdf2image import pdf2image as _pdf2image_impl
 
 # Prevent console windows from flashing when poppler subprocesses run on Windows.
+# pdf2image binds Popen into its own namespace at import time
+# (from subprocess import Popen), so subprocess.Popen alone is not enough;
+# the module attribute must be patched as well.
 if sys.platform == 'win32':
     import subprocess as _subprocess
     _OrigPopen = _subprocess.Popen
@@ -26,6 +30,7 @@ if sys.platform == 'win32':
                 kwargs['creationflags'] = _subprocess.CREATE_NO_WINDOW
             super().__init__(*args, **kwargs)
     _subprocess.Popen = _PopenNoWindow
+    _pdf2image_impl.Popen = _PopenNoWindow
 
 
 class FocusSlider(QSlider):
@@ -55,7 +60,7 @@ class ConversionWorker(QThread):
 
             if file_ext == '.pdf':
                 self.convert_pdf_to_jpg()
-            elif file_ext in ['.webp', '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.avif']:
+            elif file_ext in ['.webp', '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.avif']:
                 self.convert_image()
             else:
                 self.error.emit(f"Unsupported file format: {file_ext}")
@@ -72,24 +77,28 @@ class ConversionWorker(QThread):
         height = self.settings.get('height')
         pages = self.settings.get('pages', 'all')
 
-        # Parse page specification
+        # Parse and validate page specification before rendering anything
         page_list = None
         if pages != 'all':
             page_list = self.parse_pages(pages)
 
-        # Convert PDF to images
-        images = pdf2image.convert_from_path(
-            self.input_file,
-            dpi=pixel_density,
-            fmt='jpg'
-        )
+        # Only render the pages we need; pdf2image renders every page
+        # between first_page and last_page, so narrow the range for
+        # selections like "1,3" instead of loading the whole document.
+        convert_kwargs = {'dpi': pixel_density, 'fmt': 'jpg'}
+        if page_list:
+            convert_kwargs['first_page'] = min(page_list)
+            convert_kwargs['last_page'] = max(page_list)
+
+        images = pdf2image.convert_from_path(self.input_file, **convert_kwargs)
 
         total_pages = len(images)
         self.progress.emit(10)
 
         # Filter pages if specified
         if page_list:
-            images = [images[i-1] for i in page_list if i <= total_pages]
+            first = convert_kwargs['first_page']
+            images = [images[p - first] for p in page_list if p - first < total_pages]
 
         # Resize if width/height specified
         if width or height:
@@ -122,6 +131,11 @@ class ConversionWorker(QThread):
 
         img = Image.open(self.input_file)
 
+        # Capture EXIF from the original file before any compositing:
+        # flattening onto a new background image drops .info (and with it
+        # the EXIF bytes), which would silently disable "preserve metadata".
+        exif_data = img.info.get('exif', b'')
+
         if output_format == 'png':
             # Preserve alpha for PNG; only normalize palette mode
             if img.mode == 'P':
@@ -146,14 +160,13 @@ class ConversionWorker(QThread):
 
         self.progress.emit(80)
 
-        exif_data = img.info.get('exif', b'')
         if output_format == 'png':
             save_kwargs = {'format': 'PNG'}
             if not strip and exif_data:
                 save_kwargs['exif'] = exif_data
         else:
             save_kwargs = {'format': 'JPEG', 'quality': quality}
-            if not strip:
+            if not strip and exif_data:
                 save_kwargs['exif'] = exif_data
 
         img.save(self.output_file, **save_kwargs)
@@ -211,9 +224,17 @@ class ConversionWorker(QThread):
             part = part.strip()
             if '-' in part:
                 start, end = part.split('-')
-                pages.extend(range(int(start), int(end) + 1))
+                start, end = int(start), int(end)
+                if start < 1 or end < 1:
+                    raise ValueError(f"Invalid page range '{part}': pages start at 1")
+                if start > end:
+                    raise ValueError(f"Invalid page range '{part}': start is after end")
+                pages.extend(range(start, end + 1))
             else:
-                pages.append(int(part))
+                page = int(part)
+                if page < 1:
+                    raise ValueError(f"Invalid page number '{part}': pages start at 1")
+                pages.append(page)
         return sorted(set(pages))
 
 
@@ -650,20 +671,30 @@ class FileConverter(QMainWindow):
             self,
             "Select File(s)",
             "",
-            "Supported Files (*.pdf *.webp *.png *.avif *.jpg *.jpeg *.bmp *.tiff);;All Files (*)"
+            "Supported Files (*.pdf *.webp *.png *.avif *.jpg *.jpeg *.bmp *.tiff *.tif);;All Files (*)"
         )
         if filenames:
             self.on_files_dropped(filenames)
 
     def on_files_dropped(self, filepaths):
         """Handle multiple files being dropped or selected"""
+        skipped = []
         for filepath in filepaths:
             if filepath not in self.input_files:
                 # Validate file extension
                 ext = Path(filepath).suffix.lower()
-                if ext in ['.pdf', '.webp', '.png', '.avif', '.jpg', '.jpeg', '.bmp', '.tiff']:
+                if ext in ['.pdf', '.webp', '.png', '.avif', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif']:
                     self.input_files.append(filepath)
                     self.file_list.addItem(Path(filepath).name)
+                else:
+                    skipped.append(Path(filepath).name)
+
+        if skipped:
+            self.status_label.setText(f"Skipped {len(skipped)} file{'s' if len(skipped) > 1 else ''} — unsupported format")
+        elif self.input_files:
+            self.status_label.setText("")
+
+        self.update_convert_button()
 
         self.update_convert_button()
         self.update_settings_visibility()
@@ -712,7 +743,7 @@ class FileConverter(QMainWindow):
             return
 
         has_pdf = any(Path(f).suffix.lower() == '.pdf' for f in self.input_files)
-        has_image = any(Path(f).suffix.lower() in ['.webp', '.png', '.avif', '.jpg', '.jpeg', '.bmp', '.tiff']
+        has_image = any(Path(f).suffix.lower() in ['.webp', '.png', '.avif', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif']
                        for f in self.input_files)
 
         self.pdf_settings.setVisible(has_pdf)
@@ -746,29 +777,6 @@ class FileConverter(QMainWindow):
             self.pdf_width_input.setValue(settings["width"] or 0)
         if "height" in settings:
             self.pdf_height_input.setValue(settings["height"] or 0)
-
-    def get_current_settings(self):
-        """Get current conversion settings based on file type"""
-        if not self.input_file:
-            return {}
-
-        is_pdf = Path(self.input_file).suffix.lower() == '.pdf'
-
-        if is_pdf:
-            return {
-                'pixel_density': self.density_input.value(),
-                'width': self.pdf_width_input.value() or None,
-                'height': self.pdf_height_input.value() or None,
-                'pages': self.pages_input.text().strip() or 'all'
-            }
-        else:
-            return {
-                'quality': self.quality_slider.value(),
-                'width': self.width_input.value() or None,
-                'height': self.height_input.value() or None,
-                'fit': self.fit_combo.currentText(),
-                'strip': self.strip_checkbox.isChecked()
-            }
 
     def convert_files(self):
         """Start batch file conversion"""

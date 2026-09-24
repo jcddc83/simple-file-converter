@@ -1,5 +1,9 @@
 # File Converter
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue.svg)](https://github.com/jcddc83/simple-file-converter/releases)
+[![Release](https://img.shields.io/github/v/release/jcddc83/simple-file-converter.svg)](https://github.com/jcddc83/simple-file-converter/releases)
+
 A standalone desktop app for converting images and PDFs — drag, drop, convert. No internet connection required, no file size limits, no subscriptions.
 
 > **Status: Personal project / work in progress.** Shared as-is for anyone who finds it useful. Issues and PRs may not be addressed. Fork freely.
