@@ -612,6 +612,8 @@ class FileConverter(QMainWindow):
             }
         """)
         self.quality_slider.valueChanged.connect(self.update_quality_label)
+        self._quality_touched = False
+        self.quality_slider.valueChanged.connect(lambda _v: setattr(self, '_quality_touched', True))
         self.quality_label = QLabel("85")
         self.quality_label.setMinimumWidth(50)
         self.quality_label.setStyleSheet("font-size: 14px; font-weight: bold;")
@@ -850,6 +852,7 @@ class FileConverter(QMainWindow):
 
         # Apply settings
         if "quality" in settings:
+            self._quality_touched = True
             self.quality_slider.setValue(settings["quality"])
         if "width" in settings:
             self.width_input.setValue(settings["width"] or 0)
@@ -967,7 +970,7 @@ class FileConverter(QMainWindow):
                 'width': self.pdf_width_input.value() or None,
                 'height': self.pdf_height_input.value() or None,
                 'pages': self.pages_input.text().strip() or 'all',
-                'quality': self.quality_slider.value(),
+                'quality': self.quality_slider.value() if self._quality_touched else 95,
                 'output_format': self.output_format_combo.currentText().lower()
             }
         else:
