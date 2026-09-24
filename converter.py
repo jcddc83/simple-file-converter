@@ -73,6 +73,7 @@ class ConversionWorker(QThread):
     def convert_pdf(self):
         """Convert PDF to JPG or PNG with specified settings"""
         output_format = self.settings.get('output_format', 'jpg').lower()
+        quality = self.settings.get('quality', 85)
         pixel_density = self.settings.get('pixel_density', 300)
         width = self.settings.get('width')
         height = self.settings.get('height')
@@ -115,7 +116,7 @@ class ConversionWorker(QThread):
             if save_fmt == 'PNG':
                 images[0].save(self.output_file, 'PNG')
             else:
-                images[0].save(self.output_file, 'JPEG', quality=95)
+                images[0].save(self.output_file, 'JPEG', quality=quality)
         else:
             # Multiple pages - save with page numbers
             for i, img in enumerate(images, 1):
@@ -123,7 +124,7 @@ class ConversionWorker(QThread):
                 if save_fmt == 'PNG':
                     img.save(str(page_output), 'PNG')
                 else:
-                    img.save(str(page_output), 'JPEG', quality=95)
+                    img.save(str(page_output), 'JPEG', quality=quality)
 
         self.progress.emit(100)
 
@@ -296,82 +297,97 @@ class PresetManager:
     _app_dir.mkdir(parents=True, exist_ok=True)
     PRESETS_FILE = str(_app_dir / "presets.json")
 
+    # Output format (JPG/PNG) is deliberately NOT part of presets: the
+    # dropdown next to Convert is the single source of truth for format,
+    # and presets control everything else (quality, size, DPI, metadata).
     DEFAULT_PRESETS = {
-        "Web Optimized (WEBP/PNG → JPG)": {
+        "Web Optimized": {
             "quality": 85,
             "width": None,
             "height": None,
             "fit": "max",
-            "strip": True,
-            "output_format": "jpg"
+            "strip": True
         },
-        "High Quality (WEBP/PNG → JPG)": {
+        "High Quality": {
             "quality": 95,
             "width": None,
             "height": None,
             "fit": "max",
-            "strip": False,
-            "output_format": "jpg"
+            "strip": False
         },
-        "Thumbnail (WEBP/PNG → JPG)": {
+        "Thumbnail": {
             "quality": 80,
             "width": 400,
             "height": 400,
             "fit": "max",
-            "strip": True,
-            "output_format": "jpg"
-        },
-        "PNG Output (WEBP/JPG → PNG)": {
-            "quality": 95,
-            "width": None,
-            "height": None,
-            "fit": "max",
-            "strip": False,
-            "output_format": "png"
-        },
-        "PNG Web Optimized (→ PNG)": {
-            "quality": 95,
-            "width": None,
-            "height": None,
-            "fit": "max",
-            "strip": True,
-            "output_format": "png"
+            "strip": True
         },
         "PDF Standard (300 DPI)": {
             "pixel_density": 300,
             "width": None,
             "height": None,
-            "pages": "all",
-            "output_format": "jpg"
+            "pages": "all"
         },
         "PDF High Quality (600 DPI)": {
             "pixel_density": 600,
             "width": None,
             "height": None,
-            "pages": "all",
-            "output_format": "jpg"
+            "pages": "all"
         },
         "PDF Web (150 DPI)": {
             "pixel_density": 150,
             "width": None,
             "height": None,
-            "pages": "all",
-            "output_format": "jpg"
-        },
-        "PDF → PNG (300 DPI)": {
-            "pixel_density": 300,
-            "width": None,
-            "height": None,
-            "pages": "all",
-            "output_format": "png"
+            "pages": "all"
         }
+    }
+
+    # Exact snapshots of built-in presets shipped in earlier versions,
+    # kept so load_presets can retire them from a user's presets.json.
+    # A retired preset is removed only if it still matches one of its
+    # shipped snapshots exactly; user-edited copies are always kept.
+    RETIRED_PRESETS = {
+        "Web Optimized (WEBP/PNG → JPG)": [
+            {"quality": 85, "width": None, "height": None, "fit": "max", "strip": True},
+            {"quality": 85, "width": None, "height": None, "fit": "max", "strip": True, "output_format": "jpg"},
+        ],
+        "High Quality (WEBP/PNG → JPG)": [
+            {"quality": 95, "width": None, "height": None, "fit": "max", "strip": False},
+            {"quality": 95, "width": None, "height": None, "fit": "max", "strip": False, "output_format": "jpg"},
+        ],
+        "Thumbnail (WEBP/PNG → JPG)": [
+            {"quality": 80, "width": 400, "height": 400, "fit": "max", "strip": True},
+            {"quality": 80, "width": 400, "height": 400, "fit": "max", "strip": True, "output_format": "jpg"},
+        ],
+        "PNG Output (WEBP/JPG → PNG)": [
+            {"quality": 95, "width": None, "height": None, "fit": "max", "strip": False, "output_format": "png"},
+        ],
+        "PNG Web Optimized (→ PNG)": [
+            {"quality": 95, "width": None, "height": None, "fit": "max", "strip": True, "output_format": "png"},
+        ],
+        "PDF Standard (300 DPI)": [
+            {"pixel_density": 300, "width": None, "height": None, "pages": "all"},
+            {"pixel_density": 300, "width": None, "height": None, "pages": "all", "output_format": "jpg"},
+        ],
+        "PDF High Quality (600 DPI)": [
+            {"pixel_density": 600, "width": None, "height": None, "pages": "all"},
+            {"pixel_density": 600, "width": None, "height": None, "pages": "all", "output_format": "jpg"},
+        ],
+        "PDF Web (150 DPI)": [
+            {"pixel_density": 150, "width": None, "height": None, "pages": "all"},
+            {"pixel_density": 150, "width": None, "height": None, "pages": "all", "output_format": "jpg"},
+        ],
+        "PDF → PNG (300 DPI)": [
+            {"pixel_density": 300, "width": None, "height": None, "pages": "all", "output_format": "png"},
+        ],
     }
 
     @classmethod
     def load_presets(cls):
-        """Load presets from file, merging in any built-in presets that
-        are missing (e.g. added in newer versions). User-saved presets
-        and edits are never overwritten."""
+        """Load presets from file. Retired built-ins are dropped only if
+        they still match a shipped snapshot exactly; anything the user
+        edited or saved themselves is always kept. Current built-ins are
+        merged in if absent."""
         presets = {}
         if os.path.exists(cls.PRESETS_FILE):
             try:
@@ -381,6 +397,9 @@ class PresetManager:
                 pass
         if not isinstance(presets, dict):
             presets = {}
+        for name, snapshots in cls.RETIRED_PRESETS.items():
+            if name in presets and any(presets[name] == snapshot for snapshot in snapshots):
+                del presets[name]
         for name, settings in cls.DEFAULT_PRESETS.items():
             if name not in presets:
                 presets[name] = settings
@@ -557,6 +576,7 @@ class FileConverter(QMainWindow):
         self.output_format_combo.setStyleSheet("font-size: 13px;")
         self.output_format_combo.currentTextChanged.connect(self.update_convert_button)
         self.output_format_combo.currentTextChanged.connect(self.update_pdf_settings_title)
+        self.output_format_combo.currentTextChanged.connect(self.update_quality_enabled)
         output_format_layout.addWidget(self.output_format_combo)
         output_format_layout.addStretch()
         image_layout.addLayout(output_format_layout)
@@ -714,6 +734,8 @@ class FileConverter(QMainWindow):
 
         # Initially show/hide settings based on file type
         self.update_settings_visibility()
+        # Set initial quality-slider state for the default output format
+        self.update_quality_enabled(self.output_format_combo.currentText())
 
     def update_quality_label(self, value):
         self.quality_label.setText(str(value))
@@ -790,6 +812,15 @@ class FileConverter(QMainWindow):
         if hasattr(self, 'pdf_settings'):
             self.pdf_settings.setTitle(f"PDF Settings (PDF → {fmt})")
 
+    def update_quality_enabled(self, fmt):
+        """Quality only affects JPG compression; grey it out for PNG"""
+        enabled = fmt != 'PNG'
+        self.quality_slider.setEnabled(enabled)
+        self.quality_label.setEnabled(enabled)
+        self.quality_slider.setToolTip(
+            f"JPG quality ({self.quality_slider.value()})" if enabled
+            else "Quality has no effect on PNG output")
+
     def update_settings_visibility(self):
         """Show/hide settings based on file type"""
         # If all files are PDFs, show only PDF settings
@@ -830,10 +861,6 @@ class FileConverter(QMainWindow):
                 self.fit_combo.setCurrentIndex(index)
         if "strip" in settings:
             self.strip_checkbox.setChecked(settings["strip"])
-        if "output_format" in settings:
-            index = self.output_format_combo.findText(settings["output_format"].upper())
-            if index >= 0:
-                self.output_format_combo.setCurrentIndex(index)
         if "pixel_density" in settings:
             self.density_input.setValue(settings["pixel_density"])
         if "pages" in settings:
@@ -940,6 +967,7 @@ class FileConverter(QMainWindow):
                 'width': self.pdf_width_input.value() or None,
                 'height': self.pdf_height_input.value() or None,
                 'pages': self.pages_input.text().strip() or 'all',
+                'quality': self.quality_slider.value(),
                 'output_format': self.output_format_combo.currentText().lower()
             }
         else:
@@ -1033,7 +1061,6 @@ class FileConverter(QMainWindow):
         preset_settings['height'] = self.height_input.value() or None
         preset_settings['fit'] = self.fit_combo.currentText()
         preset_settings['strip'] = self.strip_checkbox.isChecked()
-        preset_settings['output_format'] = self.output_format_combo.currentText().lower()
 
         # PDF settings
         preset_settings['pixel_density'] = self.density_input.value()
