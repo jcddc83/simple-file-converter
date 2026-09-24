@@ -90,12 +90,17 @@ Presets are saved automatically to `%APPDATA%\FileConverter\presets.json` on Win
 
 | Preset | Settings |
 |---|---|
-| Web Optimized | Quality 85, strip metadata |
-| High Quality | Quality 95, preserve metadata |
-| Thumbnail | 400×400 max, quality 80, strip metadata |
-| PDF Standard | 300 DPI, all pages |
-| PDF High Quality | 600 DPI, all pages |
-| PDF Web | 150 DPI, all pages |
+| Web Optimized (WEBP/PNG → JPG) | Quality 85, strip metadata |
+| High Quality (WEBP/PNG → JPG) | Quality 95, preserve metadata |
+| Thumbnail (WEBP/PNG → JPG) | 400×400 max, quality 80, strip metadata |
+| PNG Output (WEBP/JPG → PNG) | PNG output, preserve metadata |
+| PNG Web Optimized (→ PNG) | PNG output, strip metadata |
+| PDF Standard (300 DPI) | 300 DPI, all pages → JPG |
+| PDF High Quality (600 DPI) | 600 DPI, all pages → JPG |
+| PDF Web (150 DPI) | 150 DPI, all pages → JPG |
+| PDF → PNG (300 DPI) | 300 DPI, all pages → PNG |
+
+Presets record the output format (JPG/PNG) along with the other settings.
 
 ---
 

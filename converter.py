@@ -302,52 +302,89 @@ class PresetManager:
             "width": None,
             "height": None,
             "fit": "max",
-            "strip": True
+            "strip": True,
+            "output_format": "jpg"
         },
         "High Quality (WEBP/PNG → JPG)": {
             "quality": 95,
             "width": None,
             "height": None,
             "fit": "max",
-            "strip": False
+            "strip": False,
+            "output_format": "jpg"
         },
         "Thumbnail (WEBP/PNG → JPG)": {
             "quality": 80,
             "width": 400,
             "height": 400,
             "fit": "max",
-            "strip": True
+            "strip": True,
+            "output_format": "jpg"
+        },
+        "PNG Output (WEBP/JPG → PNG)": {
+            "quality": 95,
+            "width": None,
+            "height": None,
+            "fit": "max",
+            "strip": False,
+            "output_format": "png"
+        },
+        "PNG Web Optimized (→ PNG)": {
+            "quality": 95,
+            "width": None,
+            "height": None,
+            "fit": "max",
+            "strip": True,
+            "output_format": "png"
         },
         "PDF Standard (300 DPI)": {
             "pixel_density": 300,
             "width": None,
             "height": None,
-            "pages": "all"
+            "pages": "all",
+            "output_format": "jpg"
         },
         "PDF High Quality (600 DPI)": {
             "pixel_density": 600,
             "width": None,
             "height": None,
-            "pages": "all"
+            "pages": "all",
+            "output_format": "jpg"
         },
         "PDF Web (150 DPI)": {
             "pixel_density": 150,
             "width": None,
             "height": None,
-            "pages": "all"
+            "pages": "all",
+            "output_format": "jpg"
+        },
+        "PDF → PNG (300 DPI)": {
+            "pixel_density": 300,
+            "width": None,
+            "height": None,
+            "pages": "all",
+            "output_format": "png"
         }
     }
 
     @classmethod
     def load_presets(cls):
-        """Load presets from file or use defaults"""
+        """Load presets from file, merging in any built-in presets that
+        are missing (e.g. added in newer versions). User-saved presets
+        and edits are never overwritten."""
+        presets = {}
         if os.path.exists(cls.PRESETS_FILE):
             try:
                 with open(cls.PRESETS_FILE, 'r') as f:
-                    return json.load(f)
+                    presets = json.load(f)
             except:
                 pass
-        return cls.DEFAULT_PRESETS.copy()
+        if not isinstance(presets, dict):
+            presets = {}
+        for name, settings in cls.DEFAULT_PRESETS.items():
+            if name not in presets:
+                presets[name] = settings
+        return presets
 
     @classmethod
     def save_presets(cls, presets):
@@ -793,6 +830,10 @@ class FileConverter(QMainWindow):
                 self.fit_combo.setCurrentIndex(index)
         if "strip" in settings:
             self.strip_checkbox.setChecked(settings["strip"])
+        if "output_format" in settings:
+            index = self.output_format_combo.findText(settings["output_format"].upper())
+            if index >= 0:
+                self.output_format_combo.setCurrentIndex(index)
         if "pixel_density" in settings:
             self.density_input.setValue(settings["pixel_density"])
         if "pages" in settings:
@@ -992,6 +1033,7 @@ class FileConverter(QMainWindow):
         preset_settings['height'] = self.height_input.value() or None
         preset_settings['fit'] = self.fit_combo.currentText()
         preset_settings['strip'] = self.strip_checkbox.isChecked()
+        preset_settings['output_format'] = self.output_format_combo.currentText().lower()
 
         # PDF settings
         preset_settings['pixel_density'] = self.density_input.value()
