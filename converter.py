@@ -59,7 +59,7 @@ class ConversionWorker(QThread):
             file_ext = Path(self.input_file).suffix.lower()
 
             if file_ext == '.pdf':
-                self.convert_pdf_to_jpg()
+                self.convert_pdf()
             elif file_ext in ['.webp', '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.avif']:
                 self.convert_image()
             else:
@@ -70,8 +70,10 @@ class ConversionWorker(QThread):
         except Exception as e:
             self.error.emit(f"Conversion failed: {str(e)}")
 
-    def convert_pdf_to_jpg(self):
-        """Convert PDF to JPG with specified settings"""
+    def convert_pdf(self):
+        """Convert PDF to JPG or PNG with specified settings"""
+        output_format = self.settings.get('output_format', 'jpg').lower()
+        quality = self.settings.get('quality', 85)
         pixel_density = self.settings.get('pixel_density', 300)
         width = self.settings.get('width')
         height = self.settings.get('height')
@@ -85,7 +87,7 @@ class ConversionWorker(QThread):
         # Only render the pages we need; pdf2image renders every page
         # between first_page and last_page, so narrow the range for
         # selections like "1,3" instead of loading the whole document.
-        convert_kwargs = {'dpi': pixel_density, 'fmt': 'jpg'}
+        convert_kwargs = {'dpi': pixel_density, 'fmt': 'png' if output_format == 'png' else 'jpg'}
         if page_list:
             convert_kwargs['first_page'] = min(page_list)
             convert_kwargs['last_page'] = max(page_list)
@@ -108,13 +110,21 @@ class ConversionWorker(QThread):
 
         # Save images
         output_path = Path(self.output_file)
+        save_fmt = 'PNG' if output_format == 'png' else 'JPEG'
+        ext = 'png' if output_format == 'png' else 'jpg'
         if len(images) == 1:
-            images[0].save(self.output_file, 'JPEG', quality=95)
+            if save_fmt == 'PNG':
+                images[0].save(self.output_file, 'PNG')
+            else:
+                images[0].save(self.output_file, 'JPEG', quality=quality)
         else:
             # Multiple pages - save with page numbers
             for i, img in enumerate(images, 1):
-                page_output = output_path.parent / f"{output_path.stem}_page{i}.jpg"
-                img.save(str(page_output), 'JPEG', quality=95)
+                page_output = output_path.parent / f"{output_path.stem}_page{i}.{ext}"
+                if save_fmt == 'PNG':
+                    img.save(str(page_output), 'PNG')
+                else:
+                    img.save(str(page_output), 'JPEG', quality=quality)
 
         self.progress.emit(100)
 
@@ -135,6 +145,12 @@ class ConversionWorker(QThread):
         # flattening onto a new background image drops .info (and with it
         # the EXIF bytes), which would silently disable "preserve metadata".
         exif_data = img.info.get('exif', b'')
+
+        # WEBP (and some TIFF) sources store EXIF as raw TIFF bytes without
+        # the b'Exif\x00\x00' APP1 header; Pillow's JPEG saver silently drops
+        # the metadata without it, so normalize before saving.
+        if exif_data and not exif_data.startswith(b'Exif\x00\x00'):
+            exif_data = b'Exif\x00\x00' + exif_data
 
         if output_format == 'png':
             # Preserve alpha for PNG; only normalize palette mode
@@ -281,22 +297,25 @@ class PresetManager:
     _app_dir.mkdir(parents=True, exist_ok=True)
     PRESETS_FILE = str(_app_dir / "presets.json")
 
+    # Output format (JPG/PNG) is deliberately NOT part of presets: the
+    # dropdown next to Convert is the single source of truth for format,
+    # and presets control everything else (quality, size, DPI, metadata).
     DEFAULT_PRESETS = {
-        "Web Optimized (WEBP/PNG → JPG)": {
+        "Web Optimized": {
             "quality": 85,
             "width": None,
             "height": None,
             "fit": "max",
             "strip": True
         },
-        "High Quality (WEBP/PNG → JPG)": {
+        "High Quality": {
             "quality": 95,
             "width": None,
             "height": None,
             "fit": "max",
             "strip": False
         },
-        "Thumbnail (WEBP/PNG → JPG)": {
+        "Thumbnail": {
             "quality": 80,
             "width": 400,
             "height": 400,
@@ -323,16 +342,68 @@ class PresetManager:
         }
     }
 
+    # Exact snapshots of built-in presets shipped in earlier versions,
+    # kept so load_presets can retire them from a user's presets.json.
+    # A retired preset is removed only if it still matches one of its
+    # shipped snapshots exactly; user-edited copies are always kept.
+    RETIRED_PRESETS = {
+        "Web Optimized (WEBP/PNG → JPG)": [
+            {"quality": 85, "width": None, "height": None, "fit": "max", "strip": True},
+            {"quality": 85, "width": None, "height": None, "fit": "max", "strip": True, "output_format": "jpg"},
+        ],
+        "High Quality (WEBP/PNG → JPG)": [
+            {"quality": 95, "width": None, "height": None, "fit": "max", "strip": False},
+            {"quality": 95, "width": None, "height": None, "fit": "max", "strip": False, "output_format": "jpg"},
+        ],
+        "Thumbnail (WEBP/PNG → JPG)": [
+            {"quality": 80, "width": 400, "height": 400, "fit": "max", "strip": True},
+            {"quality": 80, "width": 400, "height": 400, "fit": "max", "strip": True, "output_format": "jpg"},
+        ],
+        "PNG Output (WEBP/JPG → PNG)": [
+            {"quality": 95, "width": None, "height": None, "fit": "max", "strip": False, "output_format": "png"},
+        ],
+        "PNG Web Optimized (→ PNG)": [
+            {"quality": 95, "width": None, "height": None, "fit": "max", "strip": True, "output_format": "png"},
+        ],
+        "PDF Standard (300 DPI)": [
+            {"pixel_density": 300, "width": None, "height": None, "pages": "all"},
+            {"pixel_density": 300, "width": None, "height": None, "pages": "all", "output_format": "jpg"},
+        ],
+        "PDF High Quality (600 DPI)": [
+            {"pixel_density": 600, "width": None, "height": None, "pages": "all"},
+            {"pixel_density": 600, "width": None, "height": None, "pages": "all", "output_format": "jpg"},
+        ],
+        "PDF Web (150 DPI)": [
+            {"pixel_density": 150, "width": None, "height": None, "pages": "all"},
+            {"pixel_density": 150, "width": None, "height": None, "pages": "all", "output_format": "jpg"},
+        ],
+        "PDF → PNG (300 DPI)": [
+            {"pixel_density": 300, "width": None, "height": None, "pages": "all", "output_format": "png"},
+        ],
+    }
+
     @classmethod
     def load_presets(cls):
-        """Load presets from file or use defaults"""
+        """Load presets from file. Retired built-ins are dropped only if
+        they still match a shipped snapshot exactly; anything the user
+        edited or saved themselves is always kept. Current built-ins are
+        merged in if absent."""
+        presets = {}
         if os.path.exists(cls.PRESETS_FILE):
             try:
                 with open(cls.PRESETS_FILE, 'r') as f:
-                    return json.load(f)
+                    presets = json.load(f)
             except:
                 pass
-        return cls.DEFAULT_PRESETS.copy()
+        if not isinstance(presets, dict):
+            presets = {}
+        for name, snapshots in cls.RETIRED_PRESETS.items():
+            if name in presets and any(presets[name] == snapshot for snapshot in snapshots):
+                del presets[name]
+        for name, settings in cls.DEFAULT_PRESETS.items():
+            if name not in presets:
+                presets[name] = settings
+        return presets
 
     @classmethod
     def save_presets(cls, presets):
@@ -504,6 +575,8 @@ class FileConverter(QMainWindow):
         self.output_format_combo.setMinimumHeight(35)
         self.output_format_combo.setStyleSheet("font-size: 13px;")
         self.output_format_combo.currentTextChanged.connect(self.update_convert_button)
+        self.output_format_combo.currentTextChanged.connect(self.update_pdf_settings_title)
+        self.output_format_combo.currentTextChanged.connect(self.update_quality_enabled)
         output_format_layout.addWidget(self.output_format_combo)
         output_format_layout.addStretch()
         image_layout.addLayout(output_format_layout)
@@ -537,8 +610,16 @@ class FileConverter(QMainWindow):
                 margin: -8px 0;
                 border-radius: 10px;
             }
+            QSlider::groove:horizontal:disabled {
+                background: #ebebeb;
+            }
+            QSlider::handle:horizontal:disabled {
+                background: #b8b8b8;
+            }
         """)
         self.quality_slider.valueChanged.connect(self.update_quality_label)
+        self._quality_touched = False
+        self.quality_slider.valueChanged.connect(lambda _v: setattr(self, '_quality_touched', True))
         self.quality_label = QLabel("85")
         self.quality_label.setMinimumWidth(50)
         self.quality_label.setStyleSheet("font-size: 14px; font-weight: bold;")
@@ -551,7 +632,7 @@ class FileConverter(QMainWindow):
         layout.addWidget(self.image_settings)
 
         # Settings panel for PDF
-        self.pdf_settings = QGroupBox("PDF Settings (PDF → JPG)")
+        self.pdf_settings = QGroupBox("PDF Settings (PDF → JPG or PNG)")
         pdf_layout = QVBoxLayout()
         pdf_layout.setSpacing(12)
         pdf_layout.setContentsMargins(15, 15, 15, 15)
@@ -661,6 +742,8 @@ class FileConverter(QMainWindow):
 
         # Initially show/hide settings based on file type
         self.update_settings_visibility()
+        # Set initial quality-slider state for the default output format
+        self.update_quality_enabled(self.output_format_combo.currentText())
 
     def update_quality_label(self, value):
         self.quality_label.setText(str(value))
@@ -732,6 +815,20 @@ class FileConverter(QMainWindow):
         else:
             self.convert_btn.setText(f"Convert to {fmt}")
 
+    def update_pdf_settings_title(self, fmt):
+        """Keep the PDF settings title in sync with the selected output format"""
+        if hasattr(self, 'pdf_settings'):
+            self.pdf_settings.setTitle(f"PDF Settings (PDF → {fmt})")
+
+    def update_quality_enabled(self, fmt):
+        """Quality only affects JPG compression; grey it out for PNG"""
+        enabled = fmt != 'PNG'
+        self.quality_slider.setEnabled(enabled)
+        self.quality_label.setEnabled(enabled)
+        self.quality_slider.setToolTip(
+            f"JPG quality ({self.quality_slider.value()})" if enabled
+            else "Quality has no effect on PNG output")
+
     def update_settings_visibility(self):
         """Show/hide settings based on file type"""
         # If all files are PDFs, show only PDF settings
@@ -746,8 +843,11 @@ class FileConverter(QMainWindow):
         has_image = any(Path(f).suffix.lower() in ['.webp', '.png', '.avif', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif']
                        for f in self.input_files)
 
+        # The output format dropdown lives in Image Settings but applies to
+        # PDFs too, so keep the group visible for PDF-only queues.
+
         self.pdf_settings.setVisible(has_pdf)
-        self.image_settings.setVisible(has_image)
+        self.image_settings.setVisible(has_image or has_pdf)
 
     def on_preset_changed(self, preset_name):
         """Load preset settings"""
@@ -758,6 +858,7 @@ class FileConverter(QMainWindow):
 
         # Apply settings
         if "quality" in settings:
+            self._quality_touched = True
             self.quality_slider.setValue(settings["quality"])
         if "width" in settings:
             self.width_input.setValue(settings["width"] or 0)
@@ -796,8 +897,7 @@ class FileConverter(QMainWindow):
         else:
             # Single file - ask for specific filename
             input_path = Path(self.input_files[0])
-            is_pdf = input_path.suffix.lower() == '.pdf'
-            fmt = 'jpg' if is_pdf else self.output_format_combo.currentText().lower()
+            fmt = self.output_format_combo.currentText().lower()
             default_output = input_path.parent / f"{input_path.stem}.{fmt}"
             filter_str = "JPEG Image (*.jpg)" if fmt == 'jpg' else "PNG Image (*.png)"
 
@@ -838,7 +938,7 @@ class FileConverter(QMainWindow):
         if len(self.input_files) == 1 and hasattr(self, 'single_output_file'):
             output_file = self.single_output_file
         else:
-            fmt = 'jpg' if is_pdf else self.output_format_combo.currentText().lower()
+            fmt = self.output_format_combo.currentText().lower()
             output_file = str(self.output_dir / f"{input_path.stem}.{fmt}")
 
         # In batch mode, confirm before overwriting existing files
@@ -875,7 +975,9 @@ class FileConverter(QMainWindow):
                 'pixel_density': self.density_input.value(),
                 'width': self.pdf_width_input.value() or None,
                 'height': self.pdf_height_input.value() or None,
-                'pages': self.pages_input.text().strip() or 'all'
+                'pages': self.pages_input.text().strip() or 'all',
+                'quality': self.quality_slider.value() if self._quality_touched else 95,
+                'output_format': self.output_format_combo.currentText().lower()
             }
         else:
             settings = {
