@@ -943,15 +943,7 @@ class FileConverter(QMainWindow):
         if not self.input_files:
             return
 
-        # Pre-compute output names for the whole batch so same-stem files
-        # are disambiguated instead of silently colliding.
         self.batch_output_names = {}
-        if len(self.input_files) > 1:
-            fmt = self.output_format_combo.currentText().lower()
-            claimed = set()
-            for f in self.input_files:
-                p = Path(f)
-                self.batch_output_names[f] = self.get_batch_output_name(p, fmt, claimed)
 
         # Ask for output directory for batch conversion
         if len(self.input_files) > 1:
@@ -963,6 +955,14 @@ class FileConverter(QMainWindow):
             if not output_dir:
                 return
             self.output_dir = Path(output_dir)
+
+            # Pre-compute output names for the whole batch so same-stem files
+            # are disambiguated instead of silently colliding. Needs
+            # output_dir, so it must run after the directory is chosen.
+            fmt = self.output_format_combo.currentText().lower()
+            claimed = set()
+            for f in self.input_files:
+                self.batch_output_names[f] = self.get_batch_output_name(Path(f), fmt, claimed)
         else:
             # Single file - ask for specific filename
             input_path = Path(self.input_files[0])
