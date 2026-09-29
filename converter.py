@@ -5,36 +5,167 @@ File Converter - Convert images (WEBP, PNG, AVIF, BMP, TIFF, JPG) and PDFs to JP
 import sys
 import os
 import json
+import datetime
+import faulthandler
+import platform
+import traceback
+import threading
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QLabel, QPushButton, QComboBox,
-                             QSpinBox, QCheckBox, QSlider, QLineEdit, QGroupBox,
-                             QFileDialog, QProgressBar, QMessageBox, QInputDialog,
-                             QListWidget, QAbstractItemView, QScrollArea)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+                             QHBoxLayout, QPushButton, QLabel, QFileDialog,
+                             QSpinBox, QComboBox, QCheckBox, QSlider, QLineEdit,
+                             QMessageBox, QProgressBar, QGroupBox, QListWidget,
+                             QAbstractItemView, QInputDialog, QScrollArea)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, qInstallMessageHandler, QtMsgType
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PIL import Image, ImageOps
-import pdf2image
-from pdf2image import pdf2image as _pdf2image_impl
+import pypdfium2 as pdfium
+
+
+# ---------------------------------------------------------------------------
+# Logging. A windowed .exe has no console, so unhandled errors, Qt warnings
+# and native crashes are written to a log file the user can find:
+#   Windows:   %LOCALAPPDATA%\FileConverter\crash.log
+#   Mac/Linux: ~/.local/share/FileConverter/crash.log
+# ---------------------------------------------------------------------------
+if sys.platform == 'win32':
+    LOG_DIR = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'FileConverter'
+else:
+    LOG_DIR = Path.home() / '.local' / 'share' / 'FileConverter'
+LOG_FILE = LOG_DIR / 'crash.log'
+_log_handle = None
+
+
+def log_line(message):
+    """Append a timestamped line to the log; never raises."""
+    if _log_handle is None:
+        return
+    try:
+        stamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _log_handle.write(f"[{stamp}] {message}\n")
+    except (OSError, ValueError):
+        pass
+
+
+def log_exception(context, exc_info=None):
+    """Log a traceback (defaults to the exception currently being handled)."""
+    exc_type, exc, tb = exc_info or sys.exc_info()
+    text = ''.join(traceback.format_exception(exc_type, exc, tb))
+    log_line(f"{context}\n{text}")
+
+
+def _qt_message_handler(mode, context, message):
+    # Skip debug/info chatter; keep warnings, criticals and fatals
+    if mode in (QtMsgType.QtDebugMsg, QtMsgType.QtInfoMsg):
+        return
+    log_line(f"Qt {mode.name}: {message}")
+
+
+def _excepthook(exc_type, exc, tb):
+    """Log unhandled exceptions. Installing a hook also stops PyQt6 from
+    aborting the whole process when a slot raises."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    log_exception("Unhandled exception", (exc_type, exc, tb))
+    try:
+        QMessageBox.critical(
+            None,
+            "Unexpected Error",
+            f"Something went wrong: {exc}\n\nDetails were saved to:\n{LOG_FILE}"
+        )
+    except Exception:
+        pass
+
+
+def _thread_excepthook(args):
+    log_exception(f"Unhandled exception in thread {args.thread.name if args.thread else '?'}",
+                  (args.exc_type, args.exc_value, args.exc_traceback))
+
+
+def init_logging():
+    global _log_handle
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 1_000_000:
+            os.replace(LOG_FILE, LOG_FILE.with_name('crash.log.old'))
+        _log_handle = open(LOG_FILE, 'a', buffering=1, encoding='utf-8')
+        faulthandler.enable(_log_handle)  # native crashes (segfaults) too
+    except OSError:
+        _log_handle = None
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+    qInstallMessageHandler(_qt_message_handler)
+    try:
+        from PyQt6.QtCore import PYQT_VERSION_STR
+        log_line(f"Session start | Python {platform.python_version()} | {platform.platform()} | "
+                 f"PyQt {PYQT_VERSION_STR} | Pillow {Image.__version__} | "
+                 f"pypdfium2 {pdfium.version.PYPDFIUM_INFO}")
+    except Exception:
+        log_line("Session start")
 
 
 class ConversionCancelledError(Exception):
     """Raised internally when a conversion is cancelled by the user"""
 
-# Prevent console windows from flashing when poppler subprocesses run on Windows.
-# pdf2image binds Popen into its own namespace at import time
-# (from subprocess import Popen), so subprocess.Popen alone is not enough;
-# the module attribute must be patched as well.
-if sys.platform == 'win32':
-    import subprocess as _subprocess
-    _OrigPopen = _subprocess.Popen
-    class _PopenNoWindow(_OrigPopen):
-        def __init__(self, *args, **kwargs):
-            if 'creationflags' not in kwargs:
-                kwargs['creationflags'] = _subprocess.CREATE_NO_WINDOW
-            super().__init__(*args, **kwargs)
-    _subprocess.Popen = _PopenNoWindow
-    _pdf2image_impl.Popen = _PopenNoWindow
+
+# Image modes wider than 8 bits per channel that Pillow loads as one channel
+HIGH_BIT_MODES = ('I', 'F', 'I;16', 'I;16L', 'I;16B', 'I;16N')
+
+
+def reduce_to_8bit(img):
+    """Scale 16/32-bit integer or float grayscale down to 8-bit 'L'.
+    Plain convert('L') clips everything above 255, turning a 16-bit
+    image into near-solid white."""
+    if img.mode == 'F':
+        lo, hi = img.getextrema()
+        if lo >= 0 and hi <= 1.0:      # normalized 0..1 floats
+            scale, offset = 255.0, 0.0
+        elif hi > lo:                  # arbitrary range: stretch to fit
+            scale = 255.0 / (hi - lo)
+            offset = -lo * scale
+        else:
+            scale, offset = 1.0, 0.0
+        return img.point(lambda v: v * scale + offset).convert('L')
+
+    if img.mode != 'I':
+        img = img.convert('I')
+    lo, hi = img.getextrema()
+    if lo < 0 or hi > 65535:           # true 32-bit / signed data: stretch
+        scale = 255.0 / max(hi - lo, 1)
+        offset = -lo * scale
+    elif hi > 255:                     # 16-bit data: keep tonality, /256
+        scale, offset = 1 / 256, 0.0
+    else:                              # already 8-bit range
+        scale, offset = 1.0, 0.0
+    return img.point(lambda v: v * scale + offset).convert('L')
+
+
+def normalize_mode(img, output_format):
+    """Bring any Pillow image mode into one that saves cleanly as JPG/PNG."""
+    mode = img.mode
+    has_transparency = 'transparency' in img.info
+
+    if mode in HIGH_BIT_MODES:
+        # PNG can store 16-bit grayscale natively; keep it for PNG output
+        if output_format == 'png' and mode.startswith('I;16'):
+            return img if mode == 'I;16' else img.convert('I;16')
+        return reduce_to_8bit(img)
+
+    if output_format == 'png':
+        if mode in ('1', 'L', 'LA', 'RGB', 'RGBA') and not (has_transparency and mode != 'RGBA'):
+            return img
+        if mode in ('LA', 'RGBA', 'RGBa', 'PA') or has_transparency:
+            return img.convert('RGBA')
+        return img.convert('RGB')      # P, CMYK, YCbCr, LAB, HSV, ...
+
+    # JPEG has no alpha: flatten anything transparent onto white
+    if mode in ('LA', 'RGBA', 'RGBa', 'PA') or has_transparency:
+        rgba = img.convert('RGBA')
+        background = Image.new('RGB', rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.getchannel('A'))
+        return background
+    return img if mode == 'RGB' else img.convert('RGB')
 
 
 class FocusSlider(QSlider):
@@ -58,6 +189,8 @@ class ConversionWorker(QThread):
         self.output_file = output_file
         self.settings = settings
         self._cancelled = False
+        self.written_files = []  # every file this run produced
+        self.notes = []          # non-fatal remarks for the completion report
 
     def cancel(self):
         """Request cancellation; the worker stops at the next checkpoint"""
@@ -83,10 +216,24 @@ class ConversionWorker(QThread):
         except ConversionCancelledError:
             self.error.emit("Cancelled")
         except Exception as e:
+            log_exception(f"Conversion failed: {self.input_file}")
             self.error.emit(f"Conversion failed: {str(e)}")
 
+    def _output_path(self, index, count, label):
+        """Single result -> the chosen output file; several -> stem_<label>N"""
+        out = Path(self.output_file)
+        if count == 1:
+            return out
+        return out.parent / f"{out.stem}_{label}{index}.{self.ext}"
+
+    @property
+    def ext(self):
+        return 'png' if self.settings.get('output_format', 'jpg').lower() == 'png' else 'jpg'
+
     def convert_pdf(self):
-        """Convert PDF to JPG or PNG with specified settings"""
+        """Render PDF pages to JPG or PNG. Pages are rendered one at a time
+        straight to RGB pixels and encoded once, so JPG output is compressed
+        only once (no intermediate lossy step) and memory stays bounded."""
         output_format = self.settings.get('output_format', 'jpg').lower()
         quality = self.settings.get('quality', 85)
         pixel_density = self.settings.get('pixel_density', 300)
@@ -99,65 +246,48 @@ class ConversionWorker(QThread):
         if pages.lower() != 'all':
             page_list = self.parse_pages(pages)
 
-        # Only render the pages we need; pdf2image renders every page
-        # between first_page and last_page, so narrow the range for
-        # selections like "1,3" instead of loading the whole document.
-        convert_kwargs = {'dpi': pixel_density, 'fmt': 'png' if output_format == 'png' else 'jpg'}
-        if page_list:
-            convert_kwargs['first_page'] = min(page_list)
-            convert_kwargs['last_page'] = max(page_list)
+        try:
+            pdf = pdfium.PdfDocument(self.input_file)
+        except pdfium.PdfiumError as e:
+            raise ValueError(f"Could not open PDF: {e}")
 
-        images = pdf2image.convert_from_path(self.input_file, **convert_kwargs)
+        try:
+            total_pages = len(pdf)
+            wanted = page_list if page_list else list(range(1, total_pages + 1))
+            selected = [p for p in wanted if p <= total_pages]
+            if not selected:
+                raise ValueError(f"Page(s) {pages} not found (this PDF has {total_pages} page{'s' if total_pages != 1 else ''})")
+            missing = [p for p in wanted if p > total_pages]
+            if missing:
+                self.notes.append(f"pages not in document were skipped: {', '.join(map(str, missing))}")
 
-        self._check_cancelled()
-        if not images:
-            raise ValueError(f"Page(s) {pages} not found in this PDF")
-        total_pages = len(images)
-        self.progress.emit(10)
-
-        # Filter pages if specified; track the real page number of each
-        # rendered image so multi-page outputs are named after actual PDF
-        # pages (e.g. pages "1,3" -> _page1, _page3, not _page1, _page2).
-        page_numbers = None
-        if page_list:
-            first = convert_kwargs['first_page']
-            page_numbers = [p for p in page_list if p - first < total_pages]
-            images = [images[p - first] for p in page_list if p - first < total_pages]
-            if not images:
-                raise ValueError(f"Page(s) {pages} not found in this PDF")
-
-        # Resize if width/height specified
-        if width or height:
-            for i, img in enumerate(images):
+            self.progress.emit(5)
+            scale = pixel_density / 72  # PDF points are 1/72 inch
+            for i, page_no in enumerate(selected):
                 self._check_cancelled()
-                images[i] = self.resize_image(img, width, height, 'max')
+                page = pdf[page_no - 1]
+                try:
+                    img = page.render(scale=scale).to_pil().convert('RGB')
+                finally:
+                    page.close()
 
-        self.progress.emit(50)
+                if width or height:
+                    img = self.resize_image(img, width, height, 'max')
 
-        # Save images
-        output_path = Path(self.output_file)
-        save_fmt = 'PNG' if output_format == 'png' else 'JPEG'
-        ext = 'png' if output_format == 'png' else 'jpg'
-        if len(images) == 1:
-            if save_fmt == 'PNG':
-                images[0].save(self.output_file, 'PNG')
-            else:
-                images[0].save(self.output_file, 'JPEG', quality=quality)
-        else:
-            # Multiple pages - save with the real PDF page numbers
-            for i, img in enumerate(images):
-                page_no = page_numbers[i] if page_numbers else i + 1
-                page_output = output_path.parent / f"{output_path.stem}_page{page_no}.{ext}"
-                self._check_cancelled()
-                if save_fmt == 'PNG':
-                    img.save(str(page_output), 'PNG')
+                out = self._output_path(page_no, len(selected), 'page')
+                if output_format == 'png':
+                    img.save(str(out), 'PNG')
                 else:
-                    img.save(str(page_output), 'JPEG', quality=quality)
-
-        self.progress.emit(100)
+                    img.save(str(out), 'JPEG', quality=quality)
+                self.written_files.append(str(out))
+                self.progress.emit(5 + int(95 * (i + 1) / len(selected)))
+        finally:
+            pdf.close()
 
     def convert_image(self):
-        """Convert image to JPG or PNG with specified settings"""
+        """Convert an image to JPG or PNG with specified settings.
+        Multi-page TIFFs export every page (stem_pageN); animated
+        WebP/PNG/AVIF export the first frame and say so."""
         quality = self.settings.get('quality', 85)
         width = self.settings.get('width')
         height = self.settings.get('height')
@@ -165,65 +295,56 @@ class ConversionWorker(QThread):
         strip = self.settings.get('strip', False)
         output_format = self.settings.get('output_format', 'jpg').lower()
 
-        self.progress.emit(20)
+        self.progress.emit(10)
 
-        img = Image.open(self.input_file)
-        self._check_cancelled()
+        with Image.open(self.input_file) as src:
+            n_frames = getattr(src, 'n_frames', 1)
+            if src.format == 'TIFF':
+                count = n_frames
+            else:
+                count = 1
+                if n_frames > 1 and src.format != 'MPO':  # MPO = normal camera JPEG
+                    self.notes.append("animated/multi-frame image: only the first frame was converted")
 
-        # Bake the EXIF orientation into the pixels. Without this, phone
-        # photos come out sideways when metadata is stripped (the rotation
-        # tag is lost). exif_transpose also removes the orientation tag from
-        # the EXIF it keeps, so preserved metadata doesn't rotate twice.
-        img = ImageOps.exif_transpose(img)
+            for idx in range(count):
+                self._check_cancelled()
+                src.seek(idx)
 
-        # Capture EXIF before any compositing:
-        # flattening onto a new background image drops .info (and with it
-        # the EXIF bytes), which would silently disable "preserve metadata".
-        exif_data = img.info.get('exif', b'')
+                # Bake the EXIF orientation into the pixels. Without this,
+                # phone photos come out sideways when metadata is stripped
+                # (the rotation tag is lost). exif_transpose also removes the
+                # orientation tag from the EXIF it keeps, so preserved
+                # metadata doesn't rotate twice. It returns a copy.
+                img = ImageOps.exif_transpose(src)
 
-        # WEBP (and some TIFF) sources store EXIF as raw TIFF bytes without
-        # the b'Exif\x00\x00' APP1 header; Pillow's JPEG saver silently drops
-        # the metadata without it, so normalize before saving.
-        if exif_data and not exif_data.startswith(b'Exif\x00\x00'):
-            exif_data = b'Exif\x00\x00' + exif_data
+                # Capture EXIF before any compositing: converting/flattening
+                # drops .info (and with it the EXIF bytes).
+                exif_data = img.info.get('exif', b'')
 
-        if output_format == 'png':
-            # Preserve alpha for PNG; only normalize palette mode
-            if img.mode == 'P':
-                img = img.convert('RGBA')
-            elif img.mode not in ('RGB', 'RGBA', 'L', 'LA'):
-                img = img.convert('RGBA')
-        else:
-            # Flatten alpha to white background for JPEG
-            if img.mode in ('RGBA', 'LA', 'P'):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode == 'P':
-                    img = img.convert('RGBA')
-                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
-                img = background
-            elif img.mode != 'RGB':
-                img = img.convert('RGB')
+                # WEBP (and some TIFF) sources store EXIF as raw TIFF bytes
+                # without the b'Exif\x00\x00' APP1 header; Pillow's JPEG saver
+                # silently drops the metadata without it, so normalize.
+                if exif_data and not exif_data.startswith(b'Exif\x00\x00'):
+                    exif_data = b'Exif\x00\x00' + exif_data
 
-        self.progress.emit(50)
+                img = normalize_mode(img, output_format)
 
-        if width or height:
-            img = self.resize_image(img, width, height, fit)
+                if width or height:
+                    img = self.resize_image(img, width, height, fit)
 
-        self._check_cancelled()
-        self.progress.emit(80)
+                self._check_cancelled()
 
-        if output_format == 'png':
-            save_kwargs = {'format': 'PNG'}
-            if not strip and exif_data:
-                save_kwargs['exif'] = exif_data
-        else:
-            save_kwargs = {'format': 'JPEG', 'quality': quality}
-            if not strip and exif_data:
-                save_kwargs['exif'] = exif_data
+                if output_format == 'png':
+                    save_kwargs = {'format': 'PNG'}
+                else:
+                    save_kwargs = {'format': 'JPEG', 'quality': quality}
+                if not strip and exif_data:
+                    save_kwargs['exif'] = exif_data
 
-        img.save(self.output_file, **save_kwargs)
-
-        self.progress.emit(100)
+                out = self._output_path(idx + 1, count, 'page')
+                img.save(str(out), **save_kwargs)
+                self.written_files.append(str(out))
+                self.progress.emit(10 + int(90 * (idx + 1) / count))
 
     def resize_image(self, img, width, height, fit):
         """Resize image based on fit mode"""
@@ -426,26 +547,39 @@ class PresetManager:
         ],
     }
 
+    # Built-in presets the user deleted. Remembered in presets.json so a
+    # deleted built-in stays deleted across launches and updates.
+    deleted_defaults = set()
+
     @classmethod
     def load_presets(cls):
         """Load presets from file. Retired built-ins are dropped only if
         they still match a shipped snapshot exactly; anything the user
         edited or saved themselves is always kept. Current built-ins are
-        merged in if absent."""
+        merged in if absent, unless the user deleted them.
+
+        File format: {"presets": {...}, "deleted_defaults": [...]}.
+        The older format (a bare {name: settings} dict) is still read."""
         presets = {}
+        cls.deleted_defaults = set()
         if os.path.exists(cls.PRESETS_FILE):
             try:
                 with open(cls.PRESETS_FILE, 'r') as f:
-                    presets = json.load(f)
+                    data = json.load(f)
             except (OSError, ValueError):
-                pass
-        if not isinstance(presets, dict):
-            presets = {}
+                data = {}
+            if isinstance(data, dict) and isinstance(data.get("presets"), dict):
+                presets = data["presets"]
+                deleted = data.get("deleted_defaults", [])
+                if isinstance(deleted, list):
+                    cls.deleted_defaults = {d for d in deleted if isinstance(d, str)}
+            elif isinstance(data, dict):
+                presets = data  # legacy flat format
         for name, snapshots in cls.RETIRED_PRESETS.items():
             if name in presets and any(presets[name] == snapshot for snapshot in snapshots):
                 del presets[name]
         for name, settings in cls.DEFAULT_PRESETS.items():
-            if name not in presets:
+            if name not in presets and name not in cls.deleted_defaults:
                 presets[name] = settings
         return presets
 
@@ -454,10 +588,27 @@ class PresetManager:
         """Save presets to file; returns False if the file can't be written"""
         try:
             with open(cls.PRESETS_FILE, 'w') as f:
-                json.dump(presets, f, indent=2)
+                json.dump({"presets": presets,
+                           "deleted_defaults": sorted(cls.deleted_defaults)}, f, indent=2)
             return True
         except OSError:
             return False
+
+    @classmethod
+    def mark_deleted(cls, name):
+        """Remember that the user deleted a built-in preset"""
+        if name in cls.DEFAULT_PRESETS:
+            cls.deleted_defaults.add(name)
+
+    @classmethod
+    def restore_defaults(cls, presets):
+        """Re-add any missing built-ins (existing/edited presets are kept).
+        Returns the names that were restored."""
+        restored = [n for n in cls.DEFAULT_PRESETS if n not in presets]
+        for name in restored:
+            presets[name] = cls.DEFAULT_PRESETS[name]
+        cls.deleted_defaults.clear()
+        return restored
 
 
 class FileConverter(QMainWindow):
@@ -558,6 +709,13 @@ class FileConverter(QMainWindow):
         delete_preset_btn.setStyleSheet("font-size: 13px;")
         delete_preset_btn.clicked.connect(self.delete_current_preset)
         preset_layout.addWidget(delete_preset_btn)
+
+        restore_preset_btn = QPushButton("Restore Defaults")
+        restore_preset_btn.setMinimumHeight(38)
+        restore_preset_btn.setStyleSheet("font-size: 13px;")
+        restore_preset_btn.setToolTip("Bring back any built-in presets you deleted (your own presets are untouched)")
+        restore_preset_btn.clicked.connect(self.restore_default_presets)
+        preset_layout.addWidget(restore_preset_btn)
 
         layout.addLayout(preset_layout)
 
@@ -1016,6 +1174,7 @@ class FileConverter(QMainWindow):
         self.current_batch_index = 0
         self.batch_errors = []
         self.batch_successes = []
+        self.batch_notes = []
         self.overwrite_all = False
         self.batch_cancelled = False
         self.batch_running = True
@@ -1055,7 +1214,7 @@ class FileConverter(QMainWindow):
         input_path = Path(input_file)
 
         # Determine output file
-        is_pdf = input_path.suffix.lower() == '.pdf'
+        is_paged = input_path.suffix.lower() in ('.pdf', '.tif', '.tiff')  # may write stem_pageN files
         if len(self.input_files) == 1 and hasattr(self, 'single_output_file'):
             output_file = self.single_output_file
         elif getattr(self, 'batch_output_names', None) and input_file in self.batch_output_names:
@@ -1069,7 +1228,7 @@ class FileConverter(QMainWindow):
         # any existing collision, not just the base name (which is never
         # written for multi-page PDFs).
         base_out = Path(output_file)
-        if is_pdf:
+        if is_paged:
             existing = sorted(base_out.parent.glob(f"{base_out.stem}_page*.{base_out.suffix.lstrip('.')}"))
             collision = existing or ([base_out] if base_out.exists() else [])
             collision_desc = ", ".join(p.name for p in existing[:3]) if existing else base_out.name
@@ -1105,7 +1264,7 @@ class FileConverter(QMainWindow):
         self.progress_bar.setValue(0)
 
         # Get settings for this file type
-        if is_pdf:
+        if input_path.suffix.lower() == '.pdf':
             settings = {
                 'pixel_density': self.density_input.value(),
                 'width': self.pdf_width_input.value() or None,
@@ -1134,17 +1293,13 @@ class FileConverter(QMainWindow):
 
     def on_file_conversion_finished(self, message):
         """Handle successful conversion of a single file in batch"""
-        # Report the file(s) actually written: a multi-page PDF produces
-        # stem_pageN.ext files rather than the base output path. Match only
-        # the current run's extension so stale page files from earlier
-        # conversions in a different format aren't listed.
-        if Path(self.worker.input_file).suffix.lower() == '.pdf':
-            base_out = Path(self.worker.output_file)
-            expected = sorted(base_out.parent.glob(f"{base_out.stem}_page*{base_out.suffix}"))
-            written = [p.name for p in expected] or [base_out.name]
-            self.batch_successes.append(", ".join(written))
-        else:
-            self.batch_successes.append(Path(self.worker.output_file).name)
+        # Report exactly the file(s) this run wrote (a multi-page PDF/TIFF
+        # produces stem_pageN.ext files rather than the base output path)
+        name = Path(self.worker.input_file).name
+        written = [Path(p).name for p in self.worker.written_files] or [Path(self.worker.output_file).name]
+        self.batch_successes.append(", ".join(written))
+        for note in self.worker.notes:
+            self.batch_notes.append(f"{name}: {note}")
         self.current_batch_index += 1
         self.convert_next_file()
 
@@ -1180,19 +1335,21 @@ class FileConverter(QMainWindow):
         success_count = len(self.batch_successes)
         error_count = len(self.batch_errors)
 
+        notes_text = ("\n\nNote:\n" + "\n".join(f"- {n}" for n in self.batch_notes)) if self.batch_notes else ""
+
         if error_count == 0:
             if success_count == 1 and len(self.batch_successes[0].split(', ')) == 1:
                 QMessageBox.information(
                     self,
                     "Success",
-                    f"Successfully converted to {self.batch_successes[0]}!"
+                    f"Successfully converted to {self.batch_successes[0]}!{notes_text}"
                 )
             else:
                 details = "\n".join(f"- {name}" for name in self.batch_successes)
                 QMessageBox.information(
                     self,
                     "Success",
-                    f"Successfully converted {success_count} file{'s' if success_count > 1 else ''}:\n{details}"
+                    f"Successfully converted {success_count} file{'s' if success_count > 1 else ''}:\n{details}{notes_text}"
                 )
         else:
             error_details = "\n".join([f"- {name}: {err}" for name, err in self.batch_errors])
@@ -1200,7 +1357,7 @@ class FileConverter(QMainWindow):
                 self,
                 "Batch Conversion Complete",
                 f"Converted {success_count} of {total} files.\n\n"
-                f"Errors ({error_count}):\n{error_details}"
+                f"Errors ({error_count}):\n{error_details}{notes_text}"
             )
 
 
@@ -1249,6 +1406,7 @@ class FileConverter(QMainWindow):
 
         # Save preset
         self.presets[preset_name] = preset_settings
+        PresetManager.deleted_defaults.discard(preset_name)
         if not PresetManager.save_presets(self.presets):
             QMessageBox.warning(self, "Save Failed",
                                 f"Could not write presets to {PresetManager.PRESETS_FILE}")
@@ -1270,6 +1428,25 @@ class FileConverter(QMainWindow):
         self.preset_combo.blockSignals(False)
 
         QMessageBox.information(self, "Success", f"Preset '{preset_name}' saved successfully!")
+
+    def restore_default_presets(self):
+        """Bring back deleted built-in presets without touching existing ones"""
+        restored = PresetManager.restore_defaults(self.presets)
+        if not restored:
+            QMessageBox.information(self, "Restore Defaults", "All built-in presets are already present.")
+            return
+        if not PresetManager.save_presets(self.presets):
+            QMessageBox.warning(self, "Save Failed",
+                                f"Could not write presets to {PresetManager.PRESETS_FILE}")
+        current = self.preset_combo.currentText()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("Custom")
+        self.preset_combo.addItems(sorted(self.presets.keys()))
+        index = self.preset_combo.findText(current)
+        self.preset_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.preset_combo.blockSignals(False)
+        QMessageBox.information(self, "Restore Defaults", "Restored: " + ", ".join(restored))
 
     def delete_current_preset(self):
         """Delete the currently selected preset"""
@@ -1296,6 +1473,7 @@ class FileConverter(QMainWindow):
 
         # Delete preset
         del self.presets[preset_name]
+        PresetManager.mark_deleted(preset_name)
         if not PresetManager.save_presets(self.presets):
             QMessageBox.warning(self, "Save Failed",
                                 f"Could not write presets to {PresetManager.PRESETS_FILE}")
@@ -1331,6 +1509,7 @@ class FileConverter(QMainWindow):
 
 
 def main():
+    init_logging()
     # Enable high DPI scaling for better display on high-resolution screens
     # Note: In PyQt6, high DPI scaling is enabled by default
     app = QApplication(sys.argv)

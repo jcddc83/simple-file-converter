@@ -45,9 +45,6 @@ No pre-built binary is provided. Mac unsigned binaries trigger a security block 
 git clone https://github.com/jcddc83/simple-file-converter.git
 cd simple-file-converter
 pip install -r requirements.txt
-# Mac/Linux: install poppler via Homebrew or apt
-brew install poppler          # macOS
-sudo apt install poppler-utils  # Ubuntu/Debian
 python converter.py
 ```
 
@@ -70,8 +67,12 @@ python converter.py
 | Width / Height | Target dimensions in pixels. `0` = keep original. |
 | Fit | `max` — fit within bounds, keep aspect ratio. `crop` — crop to exact size. `scale` — stretch to exact size. |
 | Output Format | `JPG` or `PNG`. PNG preserves transparency; JPG composites on white. |
-| Strip metadata | Remove EXIF data from the output file. |
+| Strip metadata | Remove EXIF data from the output file. Photo orientation is always applied to the pixels, so stripped photos are never sideways. |
 | Quality | JPG compression quality, 1–100. Has no effect when output is PNG. |
+
+**Image types and bit depths:** 16-bit grayscale PNG/TIFF is scaled properly to 8-bit for JPG and kept as 16-bit for PNG output; 32-bit integer/float TIFFs, CMYK, Lab, palette and 1-bit images are converted correctly (no washed-out or blown-out results). Note that 16-bit *colour* PNGs are read by Pillow as 8-bit.
+
+**Multi-frame files:** multi-page TIFFs export every page as `name_page1`, `name_page2`, …. Animated WebP/PNG/AVIF export the first frame only, and the completion message tells you.
 
 ### PDF settings
 
@@ -102,6 +103,8 @@ Presets control quality, size, DPI and metadata. The output format (JPG/PNG) is 
 | PDF High Quality (600 DPI) | 600 DPI, all pages |
 | PDF Web (150 DPI) | 150 DPI, all pages |
 
+Deleting a built-in preset sticks: it stays deleted across launches and updates. Click **Restore Defaults** to bring back any built-ins you deleted (your own presets are never touched).
+
 ---
 
 ## Building from Source (Windows exe)
@@ -109,7 +112,7 @@ Presets control quality, size, DPI and metadata. The output format (JPG/PNG) is 
 ```powershell
 pip install -r requirements.txt
 pip install pyinstaller
-python -m PyInstaller --onefile --windowed --collect-all Pillow --collect-all pdf2image --name FileConverter converter.py
+python -m PyInstaller --onefile --windowed --collect-all Pillow --collect-all pypdfium2 --collect-all pypdfium2_raw --name FileConverter converter.py
 ```
 
 The exe will be in the `dist/` folder. Use `python -m PyInstaller` (not bare `pyinstaller`) to ensure PyInstaller runs in the same Python environment where your dependencies are installed.
@@ -118,7 +121,7 @@ To rebuild cleanly:
 
 ```powershell
 Remove-Item -Recurse -Force dist, build, FileConverter.spec
-python -m PyInstaller --onefile --windowed --collect-all Pillow --collect-all pdf2image --name FileConverter converter.py
+python -m PyInstaller --onefile --windowed --collect-all Pillow --collect-all pypdfium2 --collect-all pypdfium2_raw --name FileConverter converter.py
 ```
 
 ### Dependencies
@@ -126,12 +129,7 @@ python -m PyInstaller --onefile --windowed --collect-all Pillow --collect-all pd
 - **Python 3.8+**
 - **PyQt6** — GUI
 - **Pillow** — image processing (AVIF support included in modern pip wheels)
-- **pdf2image** — PDF conversion
-- **poppler** — required by pdf2image; must be installed separately
-
-  - Windows: download from [oschwartz10612/poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases/), extract, add `bin/` to PATH
-  - macOS: `brew install poppler`
-  - Linux: `sudo apt install poppler-utils`
+- **pypdfium2** — PDF rendering (bundles the PDFium engine; nothing else to install, and it is included inside the exe)
 
 ---
 
@@ -140,8 +138,11 @@ python -m PyInstaller --onefile --windowed --collect-all Pillow --collect-all pd
 **"No module named 'PyQt6'" when running the exe**
 Use `python -m PyInstaller` instead of bare `pyinstaller` — this ensures the build uses the same environment where PyQt6 is installed.
 
-**PDF conversion fails**
-Poppler is not installed or not in PATH. Test with `pdftoppm -h` in a terminal — it should print help text.
+**The app closes or shows "Unexpected Error"**
+Errors, Qt warnings and native crashes are logged to `%LOCALAPPDATA%\FileConverter\crash.log` on Windows (`~/.local/share/FileConverter/crash.log` on Mac/Linux). Paste the last entry when reporting a bug. The log rotates automatically at 1 MB.
+
+**A PDF fails to convert**
+Password-protected or damaged PDFs can't be opened; the error message says why. Very high DPI on large pages can run out of memory — try a lower DPI.
 
 **AVIF files don't convert**
 Your Pillow installation may not include AVIF support. Try `pip install pillow-avif-plugin` and rebuild.
