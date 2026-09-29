@@ -994,6 +994,17 @@ class FileConverter(QMainWindow):
         self.progress_bar.setVisible(True)
         self.convert_next_file()
 
+    def _release_worker(self):
+        """Drop the finished worker only after its thread has fully stopped.
+        The worker emits finished/error from inside run(), so this slot can
+        run while the QThread is still winding down; releasing the last
+        reference at that point makes Qt abort ("Destroyed while thread is
+        still running")."""
+        worker = getattr(self, 'worker', None)
+        if worker is not None:
+            worker.wait()
+        self.worker = None
+
     def cancel_batch(self):
         """User requested cancellation of the running batch"""
         self.batch_cancelled = True
@@ -1083,6 +1094,7 @@ class FileConverter(QMainWindow):
             }
 
         # Start conversion
+        self._release_worker()
         self.worker = ConversionWorker(input_file, output_file, settings)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished.connect(self.on_file_conversion_finished)
@@ -1121,7 +1133,7 @@ class FileConverter(QMainWindow):
         self.cancel_btn.setVisible(False)
         self.status_label.setText("")
         self.convert_btn.setEnabled(True)
-        self.worker = None
+        self._release_worker()
 
         if self.batch_cancelled:
             QMessageBox.information(
