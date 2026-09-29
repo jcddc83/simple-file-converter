@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QListWidget, QAbstractItemView, QScrollArea)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
-from PIL import Image
+from PIL import Image, ImageOps
 import pdf2image
 from pdf2image import pdf2image as _pdf2image_impl
 
@@ -92,11 +92,11 @@ class ConversionWorker(QThread):
         pixel_density = self.settings.get('pixel_density', 300)
         width = self.settings.get('width')
         height = self.settings.get('height')
-        pages = self.settings.get('pages', 'all')
+        pages = self.settings.get('pages', 'all').strip()
 
         # Parse and validate page specification before rendering anything
         page_list = None
-        if pages != 'all':
+        if pages.lower() != 'all':
             page_list = self.parse_pages(pages)
 
         # Only render the pages we need; pdf2image renders every page
@@ -110,6 +110,8 @@ class ConversionWorker(QThread):
         images = pdf2image.convert_from_path(self.input_file, **convert_kwargs)
 
         self._check_cancelled()
+        if not images:
+            raise ValueError(f"Page(s) {pages} not found in this PDF")
         total_pages = len(images)
         self.progress.emit(10)
 
@@ -121,6 +123,8 @@ class ConversionWorker(QThread):
             first = convert_kwargs['first_page']
             page_numbers = [p for p in page_list if p - first < total_pages]
             images = [images[p - first] for p in page_list if p - first < total_pages]
+            if not images:
+                raise ValueError(f"Page(s) {pages} not found in this PDF")
 
         # Resize if width/height specified
         if width or height:
@@ -166,7 +170,13 @@ class ConversionWorker(QThread):
         img = Image.open(self.input_file)
         self._check_cancelled()
 
-        # Capture EXIF from the original file before any compositing:
+        # Bake the EXIF orientation into the pixels. Without this, phone
+        # photos come out sideways when metadata is stripped (the rotation
+        # tag is lost). exif_transpose also removes the orientation tag from
+        # the EXIF it keeps, so preserved metadata doesn't rotate twice.
+        img = ImageOps.exif_transpose(img)
+
+        # Capture EXIF before any compositing:
         # flattening onto a new background image drops .info (and with it
         # the EXIF bytes), which would silently disable "preserve metadata".
         exif_data = img.info.get('exif', b'')
@@ -265,15 +275,20 @@ class ConversionWorker(QThread):
         for part in parts:
             part = part.strip()
             if '-' in part:
-                start, end = part.split('-')
-                start, end = int(start), int(end)
+                try:
+                    start, end = (int(x) for x in part.split('-'))
+                except ValueError:
+                    raise ValueError(f"Invalid page range '{part}'")
                 if start < 1 or end < 1:
                     raise ValueError(f"Invalid page range '{part}': pages start at 1")
                 if start > end:
                     raise ValueError(f"Invalid page range '{part}': start is after end")
                 pages.extend(range(start, end + 1))
             else:
-                page = int(part)
+                try:
+                    page = int(part)
+                except ValueError:
+                    raise ValueError(f"Invalid page number '{part}' (use e.g. all, 1-3, or 1,3,5)")
                 if page < 1:
                     raise ValueError(f"Invalid page number '{part}': pages start at 1")
                 pages.append(page)
@@ -320,7 +335,10 @@ class PresetManager:
         _app_dir = Path(os.environ.get('APPDATA', Path.home())) / 'FileConverter'
     else:
         _app_dir = Path.home() / '.config' / 'FileConverter'
-    _app_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _app_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # save_presets reports the failure when it matters
     PRESETS_FILE = str(_app_dir / "presets.json")
 
     # Output format (JPG/PNG) is deliberately NOT part of presets: the
@@ -419,7 +437,7 @@ class PresetManager:
             try:
                 with open(cls.PRESETS_FILE, 'r') as f:
                     presets = json.load(f)
-            except:
+            except (OSError, ValueError):
                 pass
         if not isinstance(presets, dict):
             presets = {}
@@ -433,9 +451,13 @@ class PresetManager:
 
     @classmethod
     def save_presets(cls, presets):
-        """Save presets to file"""
-        with open(cls.PRESETS_FILE, 'w') as f:
-            json.dump(presets, f, indent=2)
+        """Save presets to file; returns False if the file can't be written"""
+        try:
+            with open(cls.PRESETS_FILE, 'w') as f:
+                json.dump(presets, f, indent=2)
+            return True
+        except OSError:
+            return False
 
 
 class FileConverter(QMainWindow):
@@ -446,6 +468,7 @@ class FileConverter(QMainWindow):
         self.input_files = []  # Changed to list for batch processing
         self.presets = PresetManager.load_presets()
         self.current_batch_index = 0
+        self.batch_running = False
         self.init_ui()
 
     def init_ui(self):
@@ -806,6 +829,8 @@ class FileConverter(QMainWindow):
 
     def on_files_dropped(self, filepaths):
         """Handle multiple files being dropped or selected"""
+        if self.batch_running:
+            return  # the queue is frozen while a batch runs
         skipped = []
         for filepath in filepaths:
             if filepath not in self.input_files:
@@ -823,12 +848,12 @@ class FileConverter(QMainWindow):
             self.status_label.setText("")
 
         self.update_convert_button()
-
-        self.update_convert_button()
         self.update_settings_visibility()
 
     def remove_selected_files(self):
         """Remove selected files from the list"""
+        if self.batch_running:
+            return
         selected_items = self.file_list.selectedItems()
         if not selected_items:
             return
@@ -844,6 +869,8 @@ class FileConverter(QMainWindow):
 
     def clear_all_files(self):
         """Clear all files from the list"""
+        if self.batch_running:
+            return
         self.file_list.clear()
         self.input_files.clear()
         self.update_convert_button()
@@ -852,7 +879,7 @@ class FileConverter(QMainWindow):
     def update_convert_button(self):
         """Enable/disable convert button based on file list"""
         has_files = len(self.input_files) > 0
-        self.convert_btn.setEnabled(has_files)
+        self.convert_btn.setEnabled(has_files and not self.batch_running)
         fmt = self.output_format_combo.currentText() if hasattr(self, 'output_format_combo') else 'JPG'
         if has_files:
             count = len(self.input_files)
@@ -929,13 +956,15 @@ class FileConverter(QMainWindow):
         the same stem (e.g. photos/a.jpg and photos/b/a.jpg), disambiguate
         with a numeric suffix so one conversion can't overwrite or clobber
         another (or trigger a false overwrite prompt)."""
+        # Compare case-insensitively: Windows/macOS filesystems treat
+        # A.jpg and a.jpg as the same file.
         candidate = f"{input_path.stem}.{fmt}"
-        if candidate in claimed:
+        if candidate.lower() in claimed:
             n = 2
-            while f"{input_path.stem}_{n}.{fmt}" in claimed:
+            while f"{input_path.stem}_{n}.{fmt}".lower() in claimed:
                 n += 1
             candidate = f"{input_path.stem}_{n}.{fmt}"
-        claimed.add(candidate)
+        claimed.add(candidate.lower())
         return str(self.output_dir / candidate)
 
     def convert_files(self):
@@ -989,6 +1018,7 @@ class FileConverter(QMainWindow):
         self.batch_successes = []
         self.overwrite_all = False
         self.batch_cancelled = False
+        self.batch_running = True
         self.convert_btn.setEnabled(False)
         self.cancel_btn.setVisible(True)
         self.progress_bar.setVisible(True)
@@ -1057,6 +1087,7 @@ class FileConverter(QMainWindow):
                 QMessageBox.StandardButton.Cancel
             )
             if reply == QMessageBox.StandardButton.Cancel:
+                self.batch_cancelled = True
                 self.on_batch_complete()
                 return
             elif reply == QMessageBox.StandardButton.No:
@@ -1129,10 +1160,11 @@ class FileConverter(QMainWindow):
 
     def on_batch_complete(self):
         """Handle batch conversion completion"""
+        self.batch_running = False
         self.progress_bar.setVisible(False)
         self.cancel_btn.setVisible(False)
         self.status_label.setText("")
-        self.convert_btn.setEnabled(True)
+        self.convert_btn.setEnabled(bool(self.input_files))
         self._release_worker()
 
         if self.batch_cancelled:
@@ -1186,6 +1218,10 @@ class FileConverter(QMainWindow):
 
         preset_name = preset_name.strip()
 
+        if preset_name == "Custom":
+            QMessageBox.warning(self, "Invalid Name", "'Custom' is reserved. Please choose another name.")
+            return
+
         # Check if preset already exists
         if preset_name in self.presets:
             reply = QMessageBox.question(
@@ -1213,7 +1249,9 @@ class FileConverter(QMainWindow):
 
         # Save preset
         self.presets[preset_name] = preset_settings
-        PresetManager.save_presets(self.presets)
+        if not PresetManager.save_presets(self.presets):
+            QMessageBox.warning(self, "Save Failed",
+                                f"Could not write presets to {PresetManager.PRESETS_FILE}")
 
         # Update combo box
         self.preset_combo.blockSignals(True)
@@ -1258,7 +1296,9 @@ class FileConverter(QMainWindow):
 
         # Delete preset
         del self.presets[preset_name]
-        PresetManager.save_presets(self.presets)
+        if not PresetManager.save_presets(self.presets):
+            QMessageBox.warning(self, "Save Failed",
+                                f"Could not write presets to {PresetManager.PRESETS_FILE}")
 
         # Update combo box
         self.preset_combo.blockSignals(True)
